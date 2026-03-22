@@ -246,6 +246,10 @@ class WorkerSignals(QObject):
     result_ready = pyqtSignal(dict)
     single_done = pyqtSignal(dict, str)
     bulk_finished = pyqtSignal(int, str, str)
+    progress_text = pyqtSignal(str)  # status bar text updates from workers
+    extract_update = pyqtSignal(dict, int, str)  # (result, count, eta_str)
+    extract_done = pyqtSignal(int, float)  # (count, elapsed)
+    bulk_progress = pyqtSignal(int, str)  # (count, eta_str)
 
 
 # -------------------------
@@ -270,6 +274,10 @@ class AbuseIPDBApp(QMainWindow):
         self.signals.result_ready.connect(self._on_bulk_result)
         self.signals.single_done.connect(self._show_single_result)
         self.signals.bulk_finished.connect(self._on_bulk_finished)
+        self.signals.progress_text.connect(lambda t: self.status_label.setText(t))
+        self.signals.extract_update.connect(self._on_extract_update)
+        self.signals.extract_done.connect(self._on_extract_done)
+        self.signals.bulk_progress.connect(self._on_bulk_progress)
 
         self._build_ui()
 
@@ -345,11 +353,16 @@ class AbuseIPDBApp(QMainWindow):
         extract_btn.clicked.connect(self._extract_preview)
         btn_row.addWidget(extract_btn)
 
-        self.extract_check_btn = QPushButton("Check All Extracted IPs")
+        self.extract_check_btn = QPushButton("Extract & Check All")
         self.extract_check_btn.setObjectName("accent")
-        self.extract_check_btn.setEnabled(False)
         self.extract_check_btn.clicked.connect(self._extract_and_check)
         btn_row.addWidget(self.extract_check_btn)
+
+        self.extract_stop_btn = QPushButton("Stop")
+        self.extract_stop_btn.setObjectName("stop")
+        self.extract_stop_btn.setEnabled(False)
+        self.extract_stop_btn.clicked.connect(self._extract_stop)
+        btn_row.addWidget(self.extract_stop_btn)
 
         save_btn = QPushButton("Save Clean List")
         save_btn.clicked.connect(self._extract_save)
@@ -357,6 +370,19 @@ class AbuseIPDBApp(QMainWindow):
 
         btn_row.addStretch()
         layout.addLayout(btn_row)
+
+        # Progress bar for extract tab
+        extract_progress_row = QHBoxLayout()
+        self.extract_progress = QProgressBar()
+        self.extract_progress.setFixedHeight(10)
+        self.extract_progress.setValue(0)
+        extract_progress_row.addWidget(self.extract_progress, stretch=1)
+        self.extract_eta_label = QLabel("")
+        self.extract_eta_label.setFont(QFont("Consolas", 9))
+        self.extract_eta_label.setStyleSheet("color: #a6adc8;")
+        self.extract_eta_label.setFixedWidth(220)
+        extract_progress_row.addWidget(self.extract_eta_label)
+        layout.addLayout(extract_progress_row)
 
         # Stats row
         stats_group = QGroupBox("Extraction Summary")
@@ -381,27 +407,35 @@ class AbuseIPDBApp(QMainWindow):
             self.extract_stats[label] = val_lbl
         layout.addWidget(stats_group)
 
-        # Preview table — shows the clean IP list and skipped IPs
-        preview_group = QGroupBox("Extracted IPs Preview")
+        # Preview table — shows extracted IPs with check results
+        preview_group = QGroupBox("Extracted IPs")
         preview_layout = QVBoxLayout(preview_group)
 
         self.extract_table = QTableWidget()
-        self.extract_table.setColumnCount(3)
-        self.extract_table.setHorizontalHeaderLabels(["IP Address", "Status", "Reason"])
+        self.extract_table.setColumnCount(6)
+        self.extract_table.setHorizontalHeaderLabels(
+            ["IP Address", "Status", "Risk", "Confidence", "Country", "Reason"]
+        )
         self.extract_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         self.extract_table.horizontalHeader().setStretchLastSection(True)
         self.extract_table.verticalHeader().setVisible(False)
         self.extract_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.extract_table.setSortingEnabled(True)
         self.extract_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.extract_table.setColumnWidth(0, 180)
-        self.extract_table.setColumnWidth(1, 100)
+        col_widths = [150, 90, 80, 85, 90, 200]
+        for i, w in enumerate(col_widths):
+            self.extract_table.setColumnWidth(i, w)
         preview_layout.addWidget(self.extract_table)
         layout.addWidget(preview_group, stretch=1)
 
-        # Store clean IPs for later use
+        # State
         self._extracted_clean_ips: list[str] = []
         self._extracted_skipped: list[dict] = []
+        self._extract_running = False
+        self._extract_start_time = 0.0
+        self._extract_checked_count = 0
+        # Map IP -> row index for live updates during check
+        self._extract_ip_rows: dict[str, int] = {}
 
     def _extract_browse(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -411,18 +445,8 @@ class AbuseIPDBApp(QMainWindow):
         if path:
             self.extract_file_input.setText(path)
 
-    def _extract_preview(self):
-        file_path = self.extract_file_input.text().strip()
-        if not file_path:
-            QMessageBox.warning(self, "Input Required", "Please select a file.")
-            return
-
-        result = extract_and_clean(file_path)
-
-        if "error" in result:
-            QMessageBox.critical(self, "Error", result["error"])
-            return
-
+    def _extract_populate_table(self, result: dict):
+        """Populate extract table with clean + skipped IPs."""
         self._extracted_clean_ips = result["clean_ips"]
         self._extracted_skipped = result["skipped"]
 
@@ -432,66 +456,241 @@ class AbuseIPDBApp(QMainWindow):
         self.extract_stats["Private/Invalid Skipped"].setText(str(len(result["skipped"])))
         self.extract_stats["Clean Public IPs"].setText(str(result["clean_count"]))
 
-        # Color the clean count green or red
-        if result["clean_count"] > 0:
-            self.extract_stats["Clean Public IPs"].setStyleSheet("color: #a6e3a1;")
-            self.extract_check_btn.setEnabled(True)
-        else:
-            self.extract_stats["Clean Public IPs"].setStyleSheet("color: #f38ba8;")
-            self.extract_check_btn.setEnabled(False)
+        color = "#a6e3a1" if result["clean_count"] > 0 else "#f38ba8"
+        self.extract_stats["Clean Public IPs"].setStyleSheet(f"color: {color};")
 
-        # Populate preview table
+        # Populate table
         self.extract_table.setSortingEnabled(False)
         self.extract_table.setRowCount(0)
+        self._extract_ip_rows.clear()
 
-        # Clean IPs first (green)
+        # Clean IPs (green, pending check)
         for ip in result["clean_ips"]:
             row = self.extract_table.rowCount()
             self.extract_table.insertRow(row)
+            self._extract_ip_rows[ip] = row
+
             ip_item = QTableWidgetItem(ip)
             ip_item.setForeground(QColor("#22c55e"))
             self.extract_table.setItem(row, 0, ip_item)
-            status_item = QTableWidgetItem("Public")
-            status_item.setForeground(QColor("#22c55e"))
+
+            status_item = QTableWidgetItem("Pending")
+            status_item.setForeground(QColor("#a6adc8"))
             self.extract_table.setItem(row, 1, status_item)
-            self.extract_table.setItem(row, 2, QTableWidgetItem(""))
+
+            for col in range(2, 6):
+                self.extract_table.setItem(row, col, QTableWidgetItem(""))
 
         # Skipped IPs (dimmed)
         for s in result["skipped"]:
             row = self.extract_table.rowCount()
             self.extract_table.insertRow(row)
+
             ip_item = QTableWidgetItem(s["IP"])
             ip_item.setForeground(QColor("#6c7086"))
             self.extract_table.setItem(row, 0, ip_item)
+
             status_item = QTableWidgetItem("Skipped")
             status_item.setForeground(QColor("#f38ba8"))
             self.extract_table.setItem(row, 1, status_item)
+
+            for col in range(2, 5):
+                self.extract_table.setItem(row, col, QTableWidgetItem(""))
+
             reason_item = QTableWidgetItem(s["reason"])
             reason_item.setForeground(QColor("#6c7086"))
-            self.extract_table.setItem(row, 2, reason_item)
+            self.extract_table.setItem(row, 5, reason_item)
 
+        self.extract_table.setSortingEnabled(False)  # Keep off during checking
+
+    def _extract_preview(self):
+        """Extract only — no checking."""
+        file_path = self.extract_file_input.text().strip()
+        if not file_path:
+            QMessageBox.warning(self, "Input Required", "Please select a file.")
+            return
+
+        result = extract_and_clean(file_path)
+        if "error" in result:
+            QMessageBox.critical(self, "Error", result["error"])
+            return
+
+        self._extract_populate_table(result)
         self.extract_table.setSortingEnabled(True)
         self.status_label.setText(
             f"Extracted {result['raw_count']} IPs — {result['clean_count']} ready to check"
         )
 
     def _extract_and_check(self):
-        if not self._extracted_clean_ips:
-            QMessageBox.warning(self, "No IPs", "No clean IPs to check. Extract first.")
+        """Extract IPs and immediately start checking them."""
+        file_path = self.extract_file_input.text().strip()
+        if not file_path:
+            QMessageBox.warning(self, "Input Required", "Please select a file.")
             return
 
-        # Write clean IPs to a temp file, then trigger bulk check
-        import tempfile
-        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
-        tmp.write("\n".join(self._extracted_clean_ips) + "\n")
-        tmp.close()
+        result = extract_and_clean(file_path)
+        if "error" in result:
+            QMessageBox.critical(self, "Error", result["error"])
+            return
+        if result["clean_count"] == 0:
+            self._extract_populate_table(result)
+            QMessageBox.warning(self, "No Valid IPs", "No valid public IPs found after filtering.")
+            return
 
-        # Set the bulk check tab's file path and switch to it
-        self.file_path_input.setText(tmp.name)
-        self.tabs.setCurrentIndex(2)  # Bulk Check tab
-        self.status_label.setText(
-            f"{len(self._extracted_clean_ips)} extracted IPs loaded — click Start Bulk Check"
+        self._extract_populate_table(result)
+
+        # Setup progress
+        import time
+        self._extract_running = True
+        self._extract_checked_count = 0
+        self._extract_start_time = time.time()
+        self.extract_progress.setMaximum(result["clean_count"])
+        self.extract_progress.setValue(0)
+        self.extract_eta_label.setText("")
+        self.extract_check_btn.setEnabled(False)
+        self.extract_stop_btn.setEnabled(True)
+
+        self.status_label.setText(f"Checking {result['clean_count']} extracted IPs...")
+
+        threading.Thread(
+            target=self._extract_check_worker,
+            args=(list(result["clean_ips"]),),
+            daemon=True
+        ).start()
+
+    def _extract_stop(self):
+        self._extract_running = False
+        self.status_label.setText("Stopping...")
+
+    def _extract_check_worker(self, ips: list[str]):
+        """Worker thread: check all extracted IPs with per-thread sessions."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+        import threading as _threading
+
+        concurrency = int(config["DEFAULT"].get("concurrency", DEFAULTS["concurrency"]))
+        delay = float(config["DEFAULT"].get("delay", DEFAULTS["delay"]))
+        ct = float(config["DEFAULT"].get("connectTimeout", DEFAULTS["connectTimeout"]))
+        rt = float(config["DEFAULT"].get("timeout", DEFAULTS["timeout"]))
+        cache_ttl = float(config["DEFAULT"].get("cacheTTL", DEFAULTS["cacheTTL"]))
+        total = len(ips)
+        checked = 0
+        start = time.time()
+
+        def _calc_eta(count):
+            elapsed = time.time() - start
+            if count > 0 and elapsed > 0:
+                rate = count / elapsed
+                remaining = total - count
+                eta_secs = remaining / rate if rate > 0 else 0
+                return f"{count}/{total}  |  {rate:.1f} IP/s  |  ETA {int(eta_secs)}s"
+            return f"{count}/{total}"
+
+        # Check cache first — emit cached results immediately
+        ips_to_fetch = []
+        for ip in ips:
+            if not self._extract_running:
+                break
+            cached = db.get_cached(ip, ttl_hours=cache_ttl)
+            if cached:
+                cached["_cached"] = True
+                checked += 1
+                self.signals.extract_update.emit(cached, checked, _calc_eta(checked))
+            else:
+                ips_to_fetch.append(ip)
+
+        if not ips_to_fetch or not self._extract_running:
+            elapsed = time.time() - start
+            self.signals.extract_done.emit(checked, elapsed)
+            return
+
+        self.signals.progress_text.emit(
+            f"Checking {len(ips_to_fetch)} IPs ({len(ips) - len(ips_to_fetch)} cached)..."
         )
+
+        # Per-thread session factory for better connection handling
+        _thread_sessions = _threading.local()
+
+        def _get_sessions():
+            if not hasattr(_thread_sessions, "req"):
+                _thread_sessions.req = create_shared_requests_session()
+                _thread_sessions.cs = create_shared_cloudscraper_session()
+            return _thread_sessions.req, _thread_sessions.cs
+
+        def _fetch_ip(ip):
+            req_s, cs_s = _get_sessions()
+            return fetch_and_parse(ip, req_s, cs_s, delay, ct, rt, HAS_CLOUDSCRAPER)
+
+        with ThreadPoolExecutor(max_workers=concurrency) as ex:
+            futures = {ex.submit(_fetch_ip, ip): ip for ip in ips_to_fetch}
+
+            for future in as_completed(futures):
+                if not self._extract_running:
+                    ex.shutdown(wait=False, cancel_futures=True)
+                    break
+
+                ip_key = futures[future]
+                try:
+                    res = future.result()
+                except Exception as e:
+                    res = {"IP": ip_key, "error": str(e)}
+
+                if "error" not in res:
+                    tier = get_risk_tier(res.get("Confidence"))
+                    res["Risk"] = tier["label"]
+
+                db.store_result(res)
+                checked += 1
+                self.signals.extract_update.emit(res, checked, _calc_eta(checked))
+
+        elapsed = time.time() - start
+        self.signals.extract_done.emit(checked, elapsed)
+
+    def _on_extract_update(self, res: dict, count: int, eta_str: str):
+        """Main-thread handler: update extract table row and progress."""
+        ip = res.get("IP", "")
+
+        self.extract_progress.setValue(count)
+        self.extract_eta_label.setText(eta_str)
+        self.status_label.setText(f"Checking IPs... {eta_str}")
+
+        # Update the row in extract table
+        if ip in self._extract_ip_rows:
+            row = self._extract_ip_rows[ip]
+            if "error" in res:
+                color = QColor(RISK_COLORS.get("Error", "#9ca3af"))
+                self.extract_table.setItem(row, 1, self._colored_item("Error", color))
+                self.extract_table.setItem(row, 5, self._colored_item(str(res.get("error", "")), color))
+            else:
+                risk = res.get("Risk", "Clean")
+                color = QColor(RISK_COLORS.get(risk, "#cdd6f4"))
+                self.extract_table.setItem(row, 1, self._colored_item("Checked", QColor("#22c55e")))
+                self.extract_table.setItem(row, 2, self._colored_item(risk, color))
+                self.extract_table.setItem(row, 3, self._colored_item(str(res.get("Confidence", "")), color))
+                self.extract_table.setItem(row, 4, self._colored_item(str(res.get("Country", "")), color))
+
+        # Also add to all_results and results tab
+        self.all_results.append(res)
+        self._add_table_row(res)
+        self._update_risk_counter(res)
+
+    def _colored_item(self, text: str, color: QColor) -> QTableWidgetItem:
+        item = QTableWidgetItem(text)
+        item.setForeground(color)
+        return item
+
+    def _on_extract_done(self, count: int, elapsed: float):
+        """Main-thread handler: extract+check complete."""
+        self._extract_running = False
+        self.extract_check_btn.setEnabled(True)
+        self.extract_stop_btn.setEnabled(False)
+        self.extract_table.setSortingEnabled(True)
+        self.extract_progress.setValue(self.extract_progress.maximum())
+        self.extract_eta_label.setText(f"Done in {elapsed:.1f}s")
+        self.status_label.setText(f"Done — {count} IPs checked in {elapsed:.1f}s")
+        self._refresh_stats()
+        self._load_history()
+        self._update_results_count()
 
     def _extract_save(self):
         if not self._extracted_clean_ips:
@@ -651,6 +850,20 @@ class AbuseIPDBApp(QMainWindow):
         self.risk_count_labels["Error"] = err_count
 
         layout.addWidget(risk_group)
+
+        # Bulk progress bar + ETA
+        bulk_progress_row = QHBoxLayout()
+        self.bulk_progress = QProgressBar()
+        self.bulk_progress.setFixedHeight(10)
+        self.bulk_progress.setValue(0)
+        bulk_progress_row.addWidget(self.bulk_progress, stretch=1)
+        self.bulk_eta_label = QLabel("")
+        self.bulk_eta_label.setFont(QFont("Consolas", 9))
+        self.bulk_eta_label.setStyleSheet("color: #a6adc8;")
+        self.bulk_eta_label.setFixedWidth(220)
+        bulk_progress_row.addWidget(self.bulk_eta_label)
+        layout.addLayout(bulk_progress_row)
+
         layout.addStretch()
 
     # ----- Results Tab -----
@@ -1021,6 +1234,9 @@ class AbuseIPDBApp(QMainWindow):
         self.stop_btn.setEnabled(True)
         self.progress_bar.setMaximum(len(ips))
         self.progress_bar.setValue(0)
+        self.bulk_progress.setMaximum(len(ips))
+        self.bulk_progress.setValue(0)
+        self.bulk_eta_label.setText("")
 
         # Reset risk counters
         for lbl in self.risk_count_labels.values():
@@ -1043,11 +1259,24 @@ class AbuseIPDBApp(QMainWindow):
 
     def _bulk_worker(self, ips, concurrency, delay, output_base):
         from concurrent.futures import ThreadPoolExecutor, as_completed
+        import time
+        import threading as _threading
 
-        req_session = create_shared_requests_session()
-        cs_session = create_shared_cloudscraper_session()
         ct = float(config["DEFAULT"].get("connectTimeout", DEFAULTS["connectTimeout"]))
         rt = float(config["DEFAULT"].get("timeout", DEFAULTS["timeout"]))
+        cache_ttl = float(config["DEFAULT"].get("cacheTTL", DEFAULTS["cacheTTL"]))
+        total = len(ips)
+        checked = 0
+        start = time.time()
+
+        def _calc_eta(count):
+            elapsed = time.time() - start
+            if count > 0 and elapsed > 0:
+                rate = count / elapsed
+                remaining = total - count
+                eta_secs = remaining / rate if rate > 0 else 0
+                return f"{count}/{total}  |  {rate:.1f} IP/s  |  ETA {int(eta_secs)}s"
+            return f"{count}/{total}"
 
         fieldnames = [
             "IP", "Risk", "Confidence", "Reports", "Country", "ISP", "Usage Type", "ASN",
@@ -1066,41 +1295,77 @@ class AbuseIPDBApp(QMainWindow):
             pass
 
         results = []
-        with ThreadPoolExecutor(max_workers=concurrency) as ex:
-            futures = {
-                ex.submit(
-                    fetch_and_parse, ip, req_session, cs_session, delay, ct, rt, HAS_CLOUDSCRAPER
-                ): ip for ip in ips
-            }
 
-            for future in as_completed(futures):
-                if not self.is_running:
-                    ex.shutdown(wait=False, cancel_futures=True)
-                    break
-
-                ip_key = futures[future]
-                try:
-                    res = future.result()
-                except Exception as e:
-                    res = {"IP": ip_key, "error": str(e)}
-
-                if "error" not in res:
-                    tier = get_risk_tier(res.get("Confidence"))
-                    res["Risk"] = tier["label"]
-
-                # Store in database
-                db.store_result(res)
-
-                results.append(res)
-
+        # Check cache first
+        ips_to_fetch = []
+        for ip in ips:
+            if not self.is_running:
+                break
+            cached = db.get_cached(ip, ttl_hours=cache_ttl)
+            if cached:
+                cached["_cached"] = True
+                results.append(cached)
+                checked += 1
+                self.signals.result_ready.emit(cached)
+                self.signals.bulk_progress.emit(checked, _calc_eta(checked))
                 try:
                     with open(csv_path, "a", newline="", encoding="utf-8") as f:
                         writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-                        writer.writerow(res)
+                        writer.writerow(cached)
                 except Exception:
                     pass
+            else:
+                ips_to_fetch.append(ip)
 
-                self.signals.result_ready.emit(res)
+        if ips_to_fetch and self.is_running:
+            self.signals.progress_text.emit(
+                f"Checking {len(ips_to_fetch)} IPs ({len(ips) - len(ips_to_fetch)} cached)..."
+            )
+
+            # Per-thread session factory
+            _thread_sessions = _threading.local()
+
+            def _get_sessions():
+                if not hasattr(_thread_sessions, "req"):
+                    _thread_sessions.req = create_shared_requests_session()
+                    _thread_sessions.cs = create_shared_cloudscraper_session()
+                return _thread_sessions.req, _thread_sessions.cs
+
+            def _fetch_ip(ip):
+                req_s, cs_s = _get_sessions()
+                return fetch_and_parse(ip, req_s, cs_s, delay, ct, rt, HAS_CLOUDSCRAPER)
+
+            with ThreadPoolExecutor(max_workers=concurrency) as ex:
+                futures = {ex.submit(_fetch_ip, ip): ip for ip in ips_to_fetch}
+
+                for future in as_completed(futures):
+                    if not self.is_running:
+                        ex.shutdown(wait=False, cancel_futures=True)
+                        break
+
+                    ip_key = futures[future]
+                    try:
+                        res = future.result()
+                    except Exception as e:
+                        res = {"IP": ip_key, "error": str(e)}
+
+                    if "error" not in res:
+                        tier = get_risk_tier(res.get("Confidence"))
+                        res["Risk"] = tier["label"]
+
+                    db.store_result(res)
+                    results.append(res)
+
+                    try:
+                        with open(csv_path, "a", newline="", encoding="utf-8") as f:
+                            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+                            writer.writerow(res)
+                    except Exception:
+                        pass
+
+                    checked += 1
+                    self.signals.result_ready.emit(res)
+                    self.signals.bulk_progress.emit(checked, _calc_eta(checked))
 
         # Final XLSX export
         if results:
@@ -1121,10 +1386,18 @@ class AbuseIPDBApp(QMainWindow):
         self.progress_bar.setValue(self.progress_bar.value() + 1)
         self._update_results_count()
 
+    def _on_bulk_progress(self, count: int, eta_str: str):
+        """Main-thread handler: update bulk tab progress bar and ETA."""
+        self.bulk_progress.setValue(count)
+        self.bulk_eta_label.setText(eta_str)
+        self.status_label.setText(f"Checking IPs... {eta_str}")
+
     def _on_bulk_finished(self, count: int, csv_path: str, xlsx_path: str):
         self.is_running = False
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
+        self.bulk_progress.setValue(self.bulk_progress.maximum())
+        self.bulk_eta_label.setText("Done")
         self.status_label.setText(f"Done — {count} IPs checked")
         self.tabs.setCurrentIndex(2)  # Switch to results tab
         self._refresh_stats()
