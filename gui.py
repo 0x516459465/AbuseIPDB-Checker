@@ -686,8 +686,11 @@ class AbuseIPDBApp(QMainWindow):
 
         # Also add to all_results and results tab
         self.all_results.append(res)
-        self._add_table_row(res)
         self._update_risk_counter(res)
+        # Periodically refresh results page
+        if len(self.all_results) % 10 == 0:
+            self._results_page = max(0, (len(self._get_filtered_results()) - 1) // self._results_page_size)
+            self._load_results_page()
 
     def _colored_item(self, text: str, color: QColor) -> QTableWidgetItem:
         item = QTableWidgetItem(text)
@@ -704,7 +707,8 @@ class AbuseIPDBApp(QMainWindow):
         self.extract_eta_label.setText(f"Done in {elapsed:.1f}s")
         self.status_label.setText(f"Done — {count} IPs checked in {elapsed:.1f}s")
         self._refresh_stats()
-        self._update_results_count()
+        self._results_page = 0
+        self._load_results_page()
 
     def _extract_save(self):
         if not self._extracted_clean_ips:
@@ -936,6 +940,50 @@ class AbuseIPDBApp(QMainWindow):
 
         layout.addWidget(self.table, stretch=1)
 
+        # Results pagination bar
+        self._results_page = 0
+        self._results_page_size = 100
+
+        res_page_bar = QHBoxLayout()
+        self.res_first_btn = QPushButton("First")
+        self.res_first_btn.setFixedWidth(60)
+        self.res_first_btn.clicked.connect(lambda: self._results_go_page(0))
+        res_page_bar.addWidget(self.res_first_btn)
+
+        self.res_prev_btn = QPushButton("Prev")
+        self.res_prev_btn.setFixedWidth(60)
+        self.res_prev_btn.clicked.connect(lambda: self._results_go_page(self._results_page - 1))
+        res_page_bar.addWidget(self.res_prev_btn)
+
+        self.res_page_label = QLabel("Page 1 of 1")
+        self.res_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.res_page_label.setFont(QFont("Segoe UI", 9))
+        self.res_page_label.setStyleSheet("color: #cdd6f4;")
+        self.res_page_label.setFixedWidth(150)
+        res_page_bar.addWidget(self.res_page_label)
+
+        self.res_next_btn = QPushButton("Next")
+        self.res_next_btn.setFixedWidth(60)
+        self.res_next_btn.clicked.connect(lambda: self._results_go_page(self._results_page + 1))
+        res_page_bar.addWidget(self.res_next_btn)
+
+        self.res_last_btn = QPushButton("Last")
+        self.res_last_btn.setFixedWidth(60)
+        self.res_last_btn.clicked.connect(lambda: self._results_go_page(-1))  # -1 = last
+        res_page_bar.addWidget(self.res_last_btn)
+
+        res_page_bar.addSpacing(20)
+        res_page_bar.addWidget(QLabel("Per page:"))
+        self.res_page_size_combo = QComboBox()
+        self.res_page_size_combo.addItems(["50", "100", "200", "500"])
+        self.res_page_size_combo.setCurrentText("100")
+        self.res_page_size_combo.setFixedWidth(80)
+        self.res_page_size_combo.currentTextChanged.connect(self._results_page_size_changed)
+        res_page_bar.addWidget(self.res_page_size_combo)
+
+        res_page_bar.addStretch()
+        layout.addLayout(res_page_bar)
+
     # ----- History Tab -----
     def _build_history_tab(self):
         tab = QWidget()
@@ -972,7 +1020,7 @@ class AbuseIPDBApp(QMainWindow):
         self.history_search = QLineEdit()
         self.history_search.setPlaceholderText("e.g. 8.8.8")
         self.history_search.setFixedWidth(200)
-        self.history_search.returnPressed.connect(self._load_history)
+        self.history_search.returnPressed.connect(self._history_search_triggered)
         toolbar.addWidget(self.history_search)
 
         toolbar.addSpacing(15)
@@ -980,13 +1028,13 @@ class AbuseIPDBApp(QMainWindow):
         self.history_risk_filter = QComboBox()
         self.history_risk_filter.addItems(["All"] + [t["label"] for t in RISK_TIERS] + ["Error"])
         self.history_risk_filter.setFixedWidth(120)
-        self.history_risk_filter.currentTextChanged.connect(self._load_history)
+        self.history_risk_filter.currentTextChanged.connect(self._history_search_triggered)
         toolbar.addWidget(self.history_risk_filter)
 
         toolbar.addSpacing(15)
         search_btn = QPushButton("Search")
         search_btn.setObjectName("accent")
-        search_btn.clicked.connect(self._load_history)
+        search_btn.clicked.connect(self._history_search_triggered)
         toolbar.addWidget(search_btn)
 
         refresh_btn = QPushButton("Refresh Stats")
@@ -1027,6 +1075,52 @@ class AbuseIPDBApp(QMainWindow):
 
         layout.addWidget(self.history_table, stretch=1)
 
+        # Pagination bar
+        self._history_page = 0
+        self._history_page_size = 100
+
+        page_bar = QHBoxLayout()
+        self.hist_first_btn = QPushButton("First")
+        self.hist_first_btn.setFixedWidth(60)
+        self.hist_first_btn.clicked.connect(lambda: self._history_go_page(0))
+        page_bar.addWidget(self.hist_first_btn)
+
+        self.hist_prev_btn = QPushButton("Prev")
+        self.hist_prev_btn.setFixedWidth(60)
+        self.hist_prev_btn.clicked.connect(lambda: self._history_go_page(self._history_page - 1))
+        page_bar.addWidget(self.hist_prev_btn)
+
+        self.hist_page_label = QLabel("Page 1 of 1")
+        self.hist_page_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.hist_page_label.setFont(QFont("Segoe UI", 9))
+        self.hist_page_label.setStyleSheet("color: #cdd6f4;")
+        self.hist_page_label.setFixedWidth(150)
+        page_bar.addWidget(self.hist_page_label)
+
+        self.hist_next_btn = QPushButton("Next")
+        self.hist_next_btn.setFixedWidth(60)
+        self.hist_next_btn.clicked.connect(lambda: self._history_go_page(self._history_page + 1))
+        page_bar.addWidget(self.hist_next_btn)
+
+        self.hist_last_btn = QPushButton("Last")
+        self.hist_last_btn.setFixedWidth(60)
+        self.hist_last_btn.clicked.connect(lambda: self._history_go_page(self._history_total_pages - 1))
+        page_bar.addWidget(self.hist_last_btn)
+
+        page_bar.addSpacing(20)
+        page_bar.addWidget(QLabel("Per page:"))
+        self.hist_page_size_combo = QComboBox()
+        self.hist_page_size_combo.addItems(["50", "100", "200", "500"])
+        self.hist_page_size_combo.setCurrentText("100")
+        self.hist_page_size_combo.setFixedWidth(80)
+        self.hist_page_size_combo.currentTextChanged.connect(self._history_page_size_changed)
+        page_bar.addWidget(self.hist_page_size_combo)
+
+        page_bar.addStretch()
+        layout.addLayout(page_bar)
+
+        self._history_total_pages = 1
+
         # Load initial data
         self._refresh_stats()
 
@@ -1044,13 +1138,23 @@ class AbuseIPDBApp(QMainWindow):
     def _load_history(self):
         ip_filter = self.history_search.text().strip()
         risk_filter = self.history_risk_filter.currentText()
+        page_size = self._history_page_size
+        offset = self._history_page * page_size
 
         try:
-            records = db.get_history(ip_filter=ip_filter, risk_filter=risk_filter, limit=500)
             count = db.get_history_count(ip_filter=ip_filter, risk_filter=risk_filter)
+            records = db.get_history(
+                ip_filter=ip_filter, risk_filter=risk_filter,
+                limit=page_size, offset=offset,
+            )
         except Exception:
             records = []
             count = 0
+
+        # Update pagination state
+        self._history_total_pages = max(1, (count + page_size - 1) // page_size)
+        if self._history_page >= self._history_total_pages:
+            self._history_page = self._history_total_pages - 1
 
         self.history_table.setSortingEnabled(False)
         self.history_table.setRowCount(0)
@@ -1079,10 +1183,34 @@ class AbuseIPDBApp(QMainWindow):
                 self.history_table.setItem(row, col_idx, item)
 
         self.history_table.setSortingEnabled(True)
-        shown = len(records)
-        self.history_count_label.setText(
-            f"{shown} shown / {count} total" if shown < count else f"{count} records"
-        )
+
+        # Update pagination controls
+        page_num = self._history_page + 1
+        self.hist_page_label.setText(f"Page {page_num} of {self._history_total_pages}")
+        self.hist_first_btn.setEnabled(self._history_page > 0)
+        self.hist_prev_btn.setEnabled(self._history_page > 0)
+        self.hist_next_btn.setEnabled(self._history_page < self._history_total_pages - 1)
+        self.hist_last_btn.setEnabled(self._history_page < self._history_total_pages - 1)
+
+        start = offset + 1
+        end = min(offset + len(records), count)
+        self.history_count_label.setText(f"{start}–{end} of {count}")
+
+    def _history_go_page(self, page: int):
+        page = max(0, min(page, self._history_total_pages - 1))
+        if page != self._history_page:
+            self._history_page = page
+            self._load_history()
+
+    def _history_page_size_changed(self, text: str):
+        self._history_page_size = int(text)
+        self._history_page = 0
+        self._load_history()
+
+    def _history_search_triggered(self):
+        """Reset to first page and reload when search/filter changes."""
+        self._history_page = 0
+        self._load_history()
 
     def _purge_old(self):
         reply = QMessageBox.question(
@@ -1197,8 +1325,8 @@ class AbuseIPDBApp(QMainWindow):
 
         # Add to results table
         self.all_results.append(res)
-        self._add_table_row(res)
-        self._update_results_count()
+        self._results_page = max(0, (len(self._get_filtered_results()) - 1) // self._results_page_size)
+        self._load_results_page()
         self._refresh_stats()
 
     # ===========================
@@ -1400,10 +1528,12 @@ class AbuseIPDBApp(QMainWindow):
 
     def _on_bulk_result(self, res: dict):
         self.all_results.append(res)
-        self._add_table_row(res)
         self._update_risk_counter(res)
         self.progress_bar.setValue(self.progress_bar.value() + 1)
-        self._update_results_count()
+        # Auto-refresh results page every 10 results or when on last page
+        if len(self.all_results) % 10 == 0:
+            self._results_page = max(0, (len(self._get_filtered_results()) - 1) // self._results_page_size)
+            self._load_results_page()
 
     def _on_bulk_progress(self, count: int, eta_str: str):
         """Main-thread handler: update bulk tab progress bar and ETA."""
@@ -1418,6 +1548,8 @@ class AbuseIPDBApp(QMainWindow):
         self.bulk_progress.setValue(self.bulk_progress.maximum())
         self.bulk_eta_label.setText("Done")
         self.status_label.setText(f"Done — {count} IPs checked")
+        self._results_page = 0  # Show first page of results
+        self._load_results_page()
         self.tabs.setCurrentIndex(3)  # Switch to results tab
         self._refresh_stats()
         QMessageBox.information(self, "Bulk Check Complete",
@@ -1426,50 +1558,6 @@ class AbuseIPDBApp(QMainWindow):
     # ===========================
     # Results Table Helpers
     # ===========================
-    def _add_table_row(self, res: dict):
-        risk = res.get("Risk", "Error" if "error" in res else "")
-        tag = risk if risk in [t["label"] for t in RISK_TIERS] else "Error"
-
-        # Check filter
-        current_filter = self.filter_combo.currentText()
-        if current_filter != "All" and current_filter != tag:
-            return
-
-        color = QColor(RISK_COLORS.get(tag, "#cdd6f4"))
-
-        values = [
-            res.get("IP", "?"),
-            risk,
-            str(res.get("Confidence", "")),
-            str(res.get("Reports", "")),
-            str(res.get("Country", "")),
-            str(res.get("ISP", "")),
-            str(res.get("Domain", "")),
-            str(res.get("First Report UTC", "")),
-            str(res.get("Last Report UTC", "")),
-            str(res.get("Duration", "")),
-            "Error" if "error" in res else "OK",
-        ]
-
-        was_sorting = self.table.isSortingEnabled()
-        self.table.setSortingEnabled(False)
-
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        for col_idx, val in enumerate(values):
-            item = QTableWidgetItem(val)
-            item.setForeground(color)
-            # Enable numeric sorting for certain columns
-            if col_idx in (2, 3, 9):  # Confidence, Reports, Duration
-                try:
-                    item.setData(Qt.ItemDataRole.UserRole, float(val) if val else 0)
-                except ValueError:
-                    pass
-            self.table.setItem(row, col_idx, item)
-
-        self.table.setSortingEnabled(was_sorting)
-        self.table.scrollToBottom()
-
     def _update_risk_counter(self, res: dict):
         key = "Error" if "error" in res else res.get("Risk", "Clean")
         if key in self.risk_count_labels:
@@ -1477,29 +1565,46 @@ class AbuseIPDBApp(QMainWindow):
             self.risk_count_labels[key].setText(str(current + 1))
 
     def _update_results_count(self):
-        shown = self.table.rowCount()
-        total = len(self.all_results)
-        if shown == total:
-            self.results_count_label.setText(f"{total} results")
-        else:
-            self.results_count_label.setText(f"{shown} shown / {total} total")
+        self._load_results_page()
 
-    # ===========================
-    # Filter
-    # ===========================
-    def _apply_filter(self):
-        self.table.setSortingEnabled(False)
-        self.table.setRowCount(0)
-
+    def _get_filtered_results(self) -> list[dict]:
+        """Return all_results filtered by current risk filter."""
         current_filter = self.filter_combo.currentText()
+        if current_filter == "All":
+            return self.all_results
+        filtered = []
         for res in self.all_results:
             risk = res.get("Risk", "Error" if "error" in res else "")
             tag = risk if risk in [t["label"] for t in RISK_TIERS] else "Error"
+            if tag == current_filter:
+                filtered.append(res)
+        return filtered
 
-            if current_filter != "All" and current_filter != tag:
-                continue
+    def _load_results_page(self):
+        """Render the current page of results into the table."""
+        filtered = self._get_filtered_results()
+        total = len(filtered)
+        page_size = self._results_page_size
+        total_pages = max(1, (total + page_size - 1) // page_size)
 
+        # Clamp page
+        if self._results_page >= total_pages:
+            self._results_page = total_pages - 1
+        if self._results_page < 0:
+            self._results_page = 0
+
+        start = self._results_page * page_size
+        end = min(start + page_size, total)
+        page_data = filtered[start:end]
+
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(0)
+
+        for res in page_data:
+            risk = res.get("Risk", "Error" if "error" in res else "")
+            tag = risk if risk in [t["label"] for t in RISK_TIERS] else "Error"
             color = QColor(RISK_COLORS.get(tag, "#cdd6f4"))
+
             values = [
                 res.get("IP", "?"),
                 risk,
@@ -1519,10 +1624,49 @@ class AbuseIPDBApp(QMainWindow):
             for col_idx, val in enumerate(values):
                 item = QTableWidgetItem(val)
                 item.setForeground(color)
+                if col_idx in (2, 3, 9):
+                    try:
+                        item.setData(Qt.ItemDataRole.UserRole, float(val) if val else 0)
+                    except ValueError:
+                        pass
                 self.table.setItem(row, col_idx, item)
 
         self.table.setSortingEnabled(True)
-        self._update_results_count()
+
+        # Update pagination controls
+        page_num = self._results_page + 1
+        self.res_page_label.setText(f"Page {page_num} of {total_pages}")
+        self.res_first_btn.setEnabled(self._results_page > 0)
+        self.res_prev_btn.setEnabled(self._results_page > 0)
+        self.res_next_btn.setEnabled(self._results_page < total_pages - 1)
+        self.res_last_btn.setEnabled(self._results_page < total_pages - 1)
+
+        if total > 0:
+            self.results_count_label.setText(f"{start + 1}–{end} of {total}")
+        else:
+            self.results_count_label.setText("0 results")
+
+    def _results_go_page(self, page: int):
+        filtered = self._get_filtered_results()
+        total_pages = max(1, (len(filtered) + self._results_page_size - 1) // self._results_page_size)
+        if page < 0:
+            page = total_pages - 1  # -1 means last page
+        page = max(0, min(page, total_pages - 1))
+        if page != self._results_page:
+            self._results_page = page
+            self._load_results_page()
+
+    def _results_page_size_changed(self, text: str):
+        self._results_page_size = int(text)
+        self._results_page = 0
+        self._load_results_page()
+
+    # ===========================
+    # Filter
+    # ===========================
+    def _apply_filter(self):
+        self._results_page = 0
+        self._load_results_page()
 
     # ===========================
     # Smart Interactions
@@ -1602,10 +1746,10 @@ class AbuseIPDBApp(QMainWindow):
                                      QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             self.all_results.clear()
-            self.table.setRowCount(0)
             for lbl in self.risk_count_labels.values():
                 lbl.setText("0")
-            self._update_results_count()
+            self._results_page = 0
+            self._load_results_page()
 
 
 # -------------------------
