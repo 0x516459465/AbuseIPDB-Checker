@@ -1,0 +1,8 @@
+beautifulsoup4
+rich
+requests
+pandas
+lxml
+cloudscraper
+openpyxl
+PyQt6

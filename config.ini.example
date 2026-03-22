@@ -1,0 +1,8 @@
+[DEFAULT]
+confidencescore = 50
+showdetails = False
+concurrency = 3
+delay = 2
+timeout = 20
+connecttimeout = 10
+cachettl = 24
