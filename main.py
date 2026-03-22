@@ -124,6 +124,58 @@ def filter_and_validate_ips(ip_list: list[str]) -> tuple[list[str], list[dict]]:
     return valid, skipped
 
 # -------------------------
+# IP Extraction from arbitrary text
+# -------------------------
+RE_IPV4 = re.compile(
+    r'(?<![0-9.])(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?![0-9.])'
+)
+
+def extract_ips_from_text(text: str) -> list[str]:
+    """Extract all valid IPv4 addresses from arbitrary text using regex."""
+    return RE_IPV4.findall(text)
+
+def extract_and_clean(file_path: str, save_path: str | None = None) -> dict:
+    """
+    Extract IPs from any text file, deduplicate, filter out private/reserved.
+    Optionally saves the clean list to save_path.
+    Returns a summary dict with the clean IP list and stats.
+    """
+    fp = Path(file_path)
+    if not fp.exists():
+        return {"error": f"File not found: {file_path}"}
+
+    text = fp.read_text(encoding="utf-8", errors="ignore")
+    raw_ips = extract_ips_from_text(text)
+
+    if not raw_ips:
+        return {
+            "raw_count": 0,
+            "duplicates_removed": 0,
+            "skipped": [],
+            "clean_ips": [],
+            "clean_count": 0,
+        }
+
+    unique_ips, dup_count = deduplicate_ips(raw_ips)
+    clean_ips, skipped = filter_and_validate_ips(unique_ips)
+
+    result = {
+        "raw_count": len(raw_ips),
+        "duplicates_removed": dup_count,
+        "skipped": skipped,
+        "clean_ips": clean_ips,
+        "clean_count": len(clean_ips),
+    }
+
+    if save_path and clean_ips:
+        out = Path(save_path)
+        out.write_text("\n".join(clean_ips) + "\n", encoding="utf-8")
+        result["saved_to"] = str(out)
+        logging.info("Saved %d clean IPs to %s", len(clean_ips), out)
+
+    return result
+
+# -------------------------
 # Risk Classification
 # -------------------------
 RISK_TIERS = [
@@ -924,6 +976,7 @@ def main():
     parser.add_argument("-connect-timeout", type=float, help="Connect timeout in seconds (default 10 or from config)")
     parser.add_argument("--no-cache", action="store_true", help="Bypass cache and force fresh lookups")
     parser.add_argument("-cache-ttl", type=float, help="Cache TTL in hours (default 24 or from config)")
+    parser.add_argument("-extract", metavar="FILE", help="Extract IPs from any file (logs, CSV, raw text), clean, and check")
 
     args = parser.parse_args()
     setup_logging(debug=args.debug)
@@ -943,6 +996,7 @@ Usage:
  -delay S            Base delay between requests (seconds, float)
  -timeout S          Read timeout (seconds), default 20 (or from config)
  -connect-timeout S  Connect timeout (seconds), default 10 (or from config)
+ -extract <file>     Extract IPs from any file (logs, CSV, text), clean, and check
  -cache-ttl H        Cache TTL in hours (default 24 or from config)
  --no-cache          Bypass cache and force fresh lookups
  --debug             Enable verbose logging
@@ -966,7 +1020,42 @@ Usage:
     elif args.cache_ttl is not None:
         config["DEFAULT"]["cacheTTL"] = str(args.cache_ttl)
 
-    if args.ip:
+    if args.extract:
+        out_base = args.output or "report"
+        save_both = not args.nosave
+        clean_list_path = f"{out_base}_clean_ips.txt"
+
+        print(f"[cyan]Extracting IPs from:[/cyan] {args.extract}")
+        result = extract_and_clean(args.extract, save_path=clean_list_path)
+
+        if "error" in result:
+            print(f"[red]{result['error']}[/red]")
+            sys.exit(1)
+
+        print(f"[green]IPs found:[/green]          {result['raw_count']}")
+        print(f"[green]Duplicates removed:[/green] {result['duplicates_removed']}")
+        if result["skipped"]:
+            print(f"[yellow]Skipped {len(result['skipped'])} non-routable/invalid IP(s):[/yellow]")
+            for s in result["skipped"]:
+                print(f"  [dim]{s['IP']}[/dim] — {s['reason']}")
+        print(f"[green]Clean public IPs:[/green]   {result['clean_count']}")
+
+        if result["clean_count"] == 0:
+            print("[red]No valid public IPs to check.[/red]")
+            sys.exit(0)
+
+        print(f"[green]Clean list saved to:[/green] {clean_list_path}\n")
+        print(f"[cyan]Starting bulk check on {result['clean_count']} IPs...[/cyan]\n")
+
+        bulkcheck_cli(clean_list_path,
+                      output_base=out_base,
+                      save_both=save_both,
+                      concurrency=concurrency,
+                      delay=delay,
+                      use_cloudscraper_fallback=use_cloudscraper_fallback,
+                      connect_timeout=connect_timeout,
+                      read_timeout=read_timeout)
+    elif args.ip:
         check_ip_cli(args.ip,
                      details=args.details,
                      delay=delay,

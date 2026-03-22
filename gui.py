@@ -32,6 +32,7 @@ from main import (
     classify_ip,
     deduplicate_ips,
     filter_and_validate_ips,
+    extract_and_clean,
     get_risk_tier,
     RISK_TIERS,
     HAS_CLOUDSCRAPER,
@@ -299,6 +300,7 @@ class AbuseIPDBApp(QMainWindow):
         self.tabs = QTabWidget()
         root_layout.addWidget(self.tabs, stretch=1)
 
+        self._build_extract_tab()
         self._build_single_tab()
         self._build_bulk_tab()
         self._build_results_tab()
@@ -317,6 +319,197 @@ class AbuseIPDBApp(QMainWindow):
         self.progress_bar.setValue(0)
         status_layout.addWidget(self.progress_bar)
         root_layout.addLayout(status_layout)
+
+    # ----- Extract & Check Tab -----
+    def _build_extract_tab(self):
+        tab = QWidget()
+        self.tabs.addTab(tab, "  Extract & Check  ")
+        layout = QVBoxLayout(tab)
+        layout.setSpacing(10)
+
+        # File selection
+        file_group = QGroupBox("Source File (logs, CSV, firewall output, any text)")
+        file_layout = QHBoxLayout(file_group)
+        self.extract_file_input = QLineEdit()
+        self.extract_file_input.setPlaceholderText("Select any file containing IP addresses...")
+        file_layout.addWidget(self.extract_file_input, stretch=1)
+        browse_btn = QPushButton("Browse...")
+        browse_btn.clicked.connect(self._extract_browse)
+        file_layout.addWidget(browse_btn)
+        layout.addWidget(file_group)
+
+        # Action buttons
+        btn_row = QHBoxLayout()
+        extract_btn = QPushButton("Extract & Preview")
+        extract_btn.setObjectName("accent")
+        extract_btn.clicked.connect(self._extract_preview)
+        btn_row.addWidget(extract_btn)
+
+        self.extract_check_btn = QPushButton("Check All Extracted IPs")
+        self.extract_check_btn.setObjectName("accent")
+        self.extract_check_btn.setEnabled(False)
+        self.extract_check_btn.clicked.connect(self._extract_and_check)
+        btn_row.addWidget(self.extract_check_btn)
+
+        save_btn = QPushButton("Save Clean List")
+        save_btn.clicked.connect(self._extract_save)
+        btn_row.addWidget(save_btn)
+
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        # Stats row
+        stats_group = QGroupBox("Extraction Summary")
+        stats_layout = QHBoxLayout(stats_group)
+        self.extract_stats = {}
+        for label in ["IPs Found", "Duplicates Removed", "Private/Invalid Skipped", "Clean Public IPs"]:
+            col = QWidget()
+            col_lay = QVBoxLayout(col)
+            col_lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            col_lay.setSpacing(2)
+            val_lbl = QLabel("—")
+            val_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            val_lbl.setFont(QFont("Segoe UI", 18, QFont.Weight.Bold))
+            val_lbl.setStyleSheet("color: #a6e3a1;")
+            col_lay.addWidget(val_lbl)
+            name_lbl = QLabel(label)
+            name_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            name_lbl.setFont(QFont("Segoe UI", 9))
+            name_lbl.setStyleSheet("color: #a6adc8;")
+            col_lay.addWidget(name_lbl)
+            stats_layout.addWidget(col, stretch=1)
+            self.extract_stats[label] = val_lbl
+        layout.addWidget(stats_group)
+
+        # Preview table — shows the clean IP list and skipped IPs
+        preview_group = QGroupBox("Extracted IPs Preview")
+        preview_layout = QVBoxLayout(preview_group)
+
+        self.extract_table = QTableWidget()
+        self.extract_table.setColumnCount(3)
+        self.extract_table.setHorizontalHeaderLabels(["IP Address", "Status", "Reason"])
+        self.extract_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        self.extract_table.horizontalHeader().setStretchLastSection(True)
+        self.extract_table.verticalHeader().setVisible(False)
+        self.extract_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.extract_table.setSortingEnabled(True)
+        self.extract_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.extract_table.setColumnWidth(0, 180)
+        self.extract_table.setColumnWidth(1, 100)
+        preview_layout.addWidget(self.extract_table)
+        layout.addWidget(preview_group, stretch=1)
+
+        # Store clean IPs for later use
+        self._extracted_clean_ips: list[str] = []
+        self._extracted_skipped: list[dict] = []
+
+    def _extract_browse(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select File to Extract IPs From", "",
+            "All files (*.*);;Text files (*.txt);;Log files (*.log);;CSV files (*.csv)"
+        )
+        if path:
+            self.extract_file_input.setText(path)
+
+    def _extract_preview(self):
+        file_path = self.extract_file_input.text().strip()
+        if not file_path:
+            QMessageBox.warning(self, "Input Required", "Please select a file.")
+            return
+
+        result = extract_and_clean(file_path)
+
+        if "error" in result:
+            QMessageBox.critical(self, "Error", result["error"])
+            return
+
+        self._extracted_clean_ips = result["clean_ips"]
+        self._extracted_skipped = result["skipped"]
+
+        # Update stats
+        self.extract_stats["IPs Found"].setText(str(result["raw_count"]))
+        self.extract_stats["Duplicates Removed"].setText(str(result["duplicates_removed"]))
+        self.extract_stats["Private/Invalid Skipped"].setText(str(len(result["skipped"])))
+        self.extract_stats["Clean Public IPs"].setText(str(result["clean_count"]))
+
+        # Color the clean count green or red
+        if result["clean_count"] > 0:
+            self.extract_stats["Clean Public IPs"].setStyleSheet("color: #a6e3a1;")
+            self.extract_check_btn.setEnabled(True)
+        else:
+            self.extract_stats["Clean Public IPs"].setStyleSheet("color: #f38ba8;")
+            self.extract_check_btn.setEnabled(False)
+
+        # Populate preview table
+        self.extract_table.setSortingEnabled(False)
+        self.extract_table.setRowCount(0)
+
+        # Clean IPs first (green)
+        for ip in result["clean_ips"]:
+            row = self.extract_table.rowCount()
+            self.extract_table.insertRow(row)
+            ip_item = QTableWidgetItem(ip)
+            ip_item.setForeground(QColor("#22c55e"))
+            self.extract_table.setItem(row, 0, ip_item)
+            status_item = QTableWidgetItem("Public")
+            status_item.setForeground(QColor("#22c55e"))
+            self.extract_table.setItem(row, 1, status_item)
+            self.extract_table.setItem(row, 2, QTableWidgetItem(""))
+
+        # Skipped IPs (dimmed)
+        for s in result["skipped"]:
+            row = self.extract_table.rowCount()
+            self.extract_table.insertRow(row)
+            ip_item = QTableWidgetItem(s["IP"])
+            ip_item.setForeground(QColor("#6c7086"))
+            self.extract_table.setItem(row, 0, ip_item)
+            status_item = QTableWidgetItem("Skipped")
+            status_item.setForeground(QColor("#f38ba8"))
+            self.extract_table.setItem(row, 1, status_item)
+            reason_item = QTableWidgetItem(s["reason"])
+            reason_item.setForeground(QColor("#6c7086"))
+            self.extract_table.setItem(row, 2, reason_item)
+
+        self.extract_table.setSortingEnabled(True)
+        self.status_label.setText(
+            f"Extracted {result['raw_count']} IPs — {result['clean_count']} ready to check"
+        )
+
+    def _extract_and_check(self):
+        if not self._extracted_clean_ips:
+            QMessageBox.warning(self, "No IPs", "No clean IPs to check. Extract first.")
+            return
+
+        # Write clean IPs to a temp file, then trigger bulk check
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8")
+        tmp.write("\n".join(self._extracted_clean_ips) + "\n")
+        tmp.close()
+
+        # Set the bulk check tab's file path and switch to it
+        self.file_path_input.setText(tmp.name)
+        self.tabs.setCurrentIndex(2)  # Bulk Check tab
+        self.status_label.setText(
+            f"{len(self._extracted_clean_ips)} extracted IPs loaded — click Start Bulk Check"
+        )
+
+    def _extract_save(self):
+        if not self._extracted_clean_ips:
+            QMessageBox.information(self, "No Data", "No clean IPs to save. Extract first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Clean IP List", "clean_ips.txt", "Text files (*.txt)"
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text("\n".join(self._extracted_clean_ips) + "\n", encoding="utf-8")
+            QMessageBox.information(
+                self, "Saved",
+                f"Saved {len(self._extracted_clean_ips)} clean IPs to:\n{path}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Save Error", str(e))
 
     # ----- Single IP Tab -----
     def _build_single_tab(self):
