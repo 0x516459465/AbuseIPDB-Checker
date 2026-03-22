@@ -24,16 +24,10 @@ A desktop threat intelligence tool that checks IP addresses against [AbuseIPDB](
 ## Screenshots
 
 ### GUI — Bulk Check with Live Risk Breakdown
-```
-┌──────────────────────────────────────────────┐
-│  AbuseIPDB Checker — Threat Intelligence     │
-├──────────────────────────────────────────────┤
-│  [Single IP] [Bulk Check] [Results] [History]│
-│                                              │
-│  Risk Breakdown (Live):                      │
-│   12 Critical  8 High  5 Medium  3 Low  22 Clean
-└──────────────────────────────────────────────┘
-```
+| 🛡️ AbuseIPDB Checker — Threat Intelligence |
+| :--- |
+| **Menu:** `[Single IP]` &nbsp; `[Bulk Check]` &nbsp; `[Results]` &nbsp; `[History]` |
+| **Risk Breakdown (Live):**<br>🔴 12 Critical &nbsp;\|&nbsp; 🟠 8 High &nbsp;\|&nbsp; 🟡 5 Medium &nbsp;\|&nbsp; 🔵 3 Low &nbsp;\|&nbsp; 🟢 22 Clean |
 
 ### CLI — Bulk Check with Risk Summary
 ```
@@ -48,7 +42,7 @@ Skipped 2 non-routable/invalid IP(s):
 Fetching 42 IPs... ━━━━━━━━━━━━━ 100%
 
 ┌─────────── Bulk Check Summary ───────────┐
-│ IP         Risk     Confidence  Country   │
+│ IP         Risk     Confidence  Country  │
 │ 1.2.3.4   Critical 95          CN        │
 │ 5.6.7.8   Clean    0           US        │
 └──────────────────────────────────────────┘
