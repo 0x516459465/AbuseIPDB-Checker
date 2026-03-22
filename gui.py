@@ -17,8 +17,8 @@ from PyQt6.QtWidgets import (
     QMessageBox, QProgressBar, QTextEdit, QSpinBox, QDoubleSpinBox,
     QComboBox, QGroupBox, QTableWidget, QTableWidgetItem, QHeaderView,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QObject
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtCore import Qt, pyqtSignal, QObject, QTimer
+from PyQt6.QtGui import QFont, QColor, QGuiApplication
 
 # Import core logic from main.py
 from main import (
@@ -281,6 +281,19 @@ class AbuseIPDBApp(QMainWindow):
 
         self._build_ui()
 
+        # Auto-refresh when switching tabs
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+    # ===========================
+    # Tab Change — smart auto-refresh
+    # ===========================
+    def _on_tab_changed(self, index: int):
+        tab_text = self.tabs.tabText(index).strip()
+        if tab_text == "History":
+            self._refresh_stats()
+        elif tab_text == "Results":
+            self._update_results_count()
+
     # ===========================
     # UI Construction
     # ===========================
@@ -425,6 +438,8 @@ class AbuseIPDBApp(QMainWindow):
         col_widths = [150, 90, 80, 85, 90, 200]
         for i, w in enumerate(col_widths):
             self.extract_table.setColumnWidth(i, w)
+        # Double-click → copy IP to clipboard
+        self.extract_table.doubleClicked.connect(self._extract_double_click)
         preview_layout.addWidget(self.extract_table)
         layout.addWidget(preview_group, stretch=1)
 
@@ -689,7 +704,6 @@ class AbuseIPDBApp(QMainWindow):
         self.extract_eta_label.setText(f"Done in {elapsed:.1f}s")
         self.status_label.setText(f"Done — {count} IPs checked in {elapsed:.1f}s")
         self._refresh_stats()
-        self._load_history()
         self._update_results_count()
 
     def _extract_save(self):
@@ -917,6 +931,9 @@ class AbuseIPDBApp(QMainWindow):
         for i, w in enumerate(widths):
             self.table.setColumnWidth(i, w)
 
+        # Double-click → copy IP to clipboard
+        self.table.doubleClicked.connect(self._results_double_click)
+
         layout.addWidget(self.table, stretch=1)
 
     # ----- History Tab -----
@@ -1005,11 +1022,13 @@ class AbuseIPDBApp(QMainWindow):
         for i, w in enumerate(hist_widths):
             self.history_table.setColumnWidth(i, w)
 
+        # Double-click a row → re-check that IP in Single IP tab
+        self.history_table.doubleClicked.connect(self._history_double_click)
+
         layout.addWidget(self.history_table, stretch=1)
 
         # Load initial data
         self._refresh_stats()
-        self._load_history()
 
     def _refresh_stats(self):
         try:
@@ -1020,6 +1039,7 @@ class AbuseIPDBApp(QMainWindow):
             self.stats_labels["Last Check"].setText(str(stats["last_check"] or "—"))
         except Exception:
             pass
+        self._load_history()
 
     def _load_history(self):
         ip_filter = self.history_search.text().strip()
@@ -1074,7 +1094,6 @@ class AbuseIPDBApp(QMainWindow):
             deleted = db.delete_old_records(days=90)
             QMessageBox.information(self, "Purged", f"Deleted {deleted} old records.")
             self._refresh_stats()
-            self._load_history()
 
     # ===========================
     # Single IP Check
@@ -1225,9 +1244,9 @@ class AbuseIPDBApp(QMainWindow):
                                 "No valid public IPs after filtering.\n" + "\n".join(info_parts))
             return
 
+        # Show pre-processing info in status bar (non-blocking)
         if info_parts:
-            QMessageBox.information(self, "Pre-processing",
-                                    f"Checking {len(ips)} valid IPs.\n" + "\n".join(info_parts))
+            self.status_label.setText(f"{len(ips)} valid IPs — " + ", ".join(info_parts))
 
         self.is_running = True
         self.start_btn.setEnabled(False)
@@ -1399,9 +1418,8 @@ class AbuseIPDBApp(QMainWindow):
         self.bulk_progress.setValue(self.bulk_progress.maximum())
         self.bulk_eta_label.setText("Done")
         self.status_label.setText(f"Done — {count} IPs checked")
-        self.tabs.setCurrentIndex(2)  # Switch to results tab
+        self.tabs.setCurrentIndex(3)  # Switch to results tab
         self._refresh_stats()
-        self._load_history()
         QMessageBox.information(self, "Bulk Check Complete",
                                 f"Checked {count} IPs.\n\nCSV: {csv_path}\nXLSX: {xlsx_path}")
 
@@ -1450,6 +1468,7 @@ class AbuseIPDBApp(QMainWindow):
             self.table.setItem(row, col_idx, item)
 
         self.table.setSortingEnabled(was_sorting)
+        self.table.scrollToBottom()
 
     def _update_risk_counter(self, res: dict):
         key = "Error" if "error" in res else res.get("Risk", "Clean")
@@ -1504,6 +1523,33 @@ class AbuseIPDBApp(QMainWindow):
 
         self.table.setSortingEnabled(True)
         self._update_results_count()
+
+    # ===========================
+    # Smart Interactions
+    # ===========================
+    def _copy_ip_to_clipboard(self, table: QTableWidget, row: int):
+        """Copy the IP from the first column of the given row to clipboard."""
+        item = table.item(row, 0)
+        if item:
+            QGuiApplication.clipboard().setText(item.text())
+            self.status_label.setText(f"Copied: {item.text()}")
+            # Reset status after 2 seconds
+            QTimer.singleShot(2000, lambda: self.status_label.setText("Ready"))
+
+    def _extract_double_click(self, index):
+        self._copy_ip_to_clipboard(self.extract_table, index.row())
+
+    def _results_double_click(self, index):
+        self._copy_ip_to_clipboard(self.table, index.row())
+
+    def _history_double_click(self, index):
+        """Double-click in history → load IP into Single IP tab and check it."""
+        item = self.history_table.item(index.row(), 0)
+        if item:
+            ip = item.text()
+            self.single_ip_input.setText(ip)
+            self.tabs.setCurrentIndex(1)  # Switch to Single IP tab
+            self._check_single()
 
     # ===========================
     # Export
