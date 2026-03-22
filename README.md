@@ -21,15 +21,7 @@ A desktop threat intelligence tool that checks IP addresses against [AbuseIPDB](
 - **Retry & Fallback** — Automatic retries with exponential backoff; optional cloudscraper fallback for anti-bot bypass
 - **Rotating Logs** — File-based rotating logs + rich console output
 
-## Screenshots
-
-### GUI — Bulk Check with Live Risk Breakdown
-| 🛡️ AbuseIPDB Checker — Threat Intelligence |
-| :--- |
-| **Menu:** `[Single IP]` &nbsp; `[Bulk Check]` &nbsp; `[Results]` &nbsp; `[History]` |
-| **Risk Breakdown (Live):**<br>🔴 12 Critical &nbsp;\|&nbsp; 🟠 8 High &nbsp;\|&nbsp; 🟡 5 Medium &nbsp;\|&nbsp; 🔵 3 Low &nbsp;\|&nbsp; 🟢 22 Clean |
-
-### CLI — Bulk Check with Risk Summary
+## CLI — Bulk Check with Risk Summary
 ```
 $ python main.py -file ips.txt -output report
 
